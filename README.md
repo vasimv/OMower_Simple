@@ -1,9 +1,13 @@
 This software contains demo firmware for OMower SDK with all basic stuff initialization, etc. It can do some simple commands:
 
 Move inside wire perimeter
+
 Follow wire perimeter
+
 Move by GPS or RTK GPS (with RTK GPS you can use "zigzag" or "spiral" patterns)
+
 Move by compass
+
 
 The firmware is controlled by "pfodApp" program.
 
