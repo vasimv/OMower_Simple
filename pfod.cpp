@@ -4,10 +4,11 @@
 #include "OMower_Simple.h"
 #include "robot.h"
 #include "pfod.h"
+#include "modbus.h"
 #include <string.h>
 
 // Receive buffer for pfod command
-char pfodRcvBuf[64];
+uint8_t pfodRcvBuf[64];
 uint32_t pfodLen = 0;
 
 // current menu
@@ -63,6 +64,7 @@ void sendSettingsMenu(boolean update) {
   sendButton("r11", F("Load settings"));
   sendButton("m03", F("Motors settings"));
   sendButton("m04", F("Mowing settings"));
+  sendButton("m07", F("Navigation settings"));
   sendButton("m05", F("Other settings"));
   sendMenuFinish();
 } // void sendSettingsMenu(boolean update)
@@ -113,19 +115,31 @@ void sendOtherSettingsMenu(boolean update) {
   sendSlider("s51", F("Backward time"), optBackwardTime, "ms", 200, 5000, 200);
   sendSlider("s52", F("Minimum roll time"), optRollTimeMin, "ms", 100, 4000, 100);
   sendSlider("s53", F("Maximum roll time"), optRollTimeMax, "ms", 100, 9000, 200);
-  
-  sendSlider("s60", F("Zigzag square size"), optSquareSize, "pt", 100, 2000, 10);
+  sendSlider("s64", F("Square size"), optSquareSize, "kCm", 1, 2000, 10);
+  sendSlider("s65", F("Square offset"), optSquareOffset, "kCm", 1, 200, 1);
+  sendSlider("s66", F("Square increment"), optSquareInc, "kCm", 1, 100, 1);
+  sendSlider("s67", F("Square cycles"), optSquareCycles, "n", 1, 2000, 1);
+  sendMenuFinish();
+} // void sendOtherSettingsMenu(boolean update)
+
+void sendNavSettingsMenu(boolean update) {
+  debug(L_INFO, (char *) F("pfod.cpp: sending navigation settings menu\n"));
+  sendMenuStart(update, F("Navigation settings"));
+  sendButton("m00", F("Main menu"));
+  sendSlider("s62", F("GPS receiver offset"), oGps.distCenter, "cm", 0, 100, 1);
+  sendSlider("s63", F("GPS receiver angle"), oGps.angleCenter, "deg", -179, 180, 1);
   sendSlider("s55", F("Magnetic inclination"), oImu.inclMag, "deg", 0.1, 20, -20);
   sendSlider("s56", F("Stop distance (non-precision)"), oGps.stopDistance, "m", 0.1, 5, 0.1);
   sendSlider("s57", F("Stop distance (precision)"), oGps.stopDistancePrecision, "m", 0.1, 5, 0.1);
   sendMenuFinish();
-} // void sendOtherSettingsMenu(boolean update)
+} // void sendNavSettingsMenu(boolean update)
 
 void sendMainMenu(boolean update) {
   debug(L_INFO, (char *) F("pfod.cpp: sending main menu\n"));
   sendMenuStart(update, F("Main menu"));
   // Send name of current command
   sendLabel("l00", String(cmdLabels[cmdRun]));
+  
   sendButton("c00", F("Cmd STOP"));
   sendButton("c01", F("Cmd MOVE"));
   sendButton("c02", F("Cmd HOME"));
@@ -135,6 +149,9 @@ void sendMainMenu(boolean update) {
   sendButton("c05", F("Cmd SOUTH"));
   sendButton("c06", F("Cmd EAST"));
   sendButton("c07", F("Cmd WEST"));
+  sendButton("c21", F("Cmd MODE POWERSAVE"));
+  sendButton("c22", F("Cmd MODE NORMAL"));
+  sendButton("c23", F("Cmd SHUTDOWN"));
   sendButton("m01", F("Settings menu"));
   sendButton("m02", F("Info menu"));
   sendButton("m06", F("Test point moveme"));
@@ -325,6 +342,9 @@ void processSetting(uint16_t cmdNum, char *rest) {
     case 60:
       optSquareSize = processSlider(rest) * 100;
       break;
+    case 61:
+      oPower.minSolarVoltage = (float) processSlider(rest) * 0.1;
+      break;
     case 55:
       oImu.inclMag = (float) processSlider(rest) * 0.1;
       break;
@@ -333,6 +353,24 @@ void processSetting(uint16_t cmdNum, char *rest) {
       break;
     case 57:
       oGps.stopDistancePrecision = (float) processSlider(rest) * 0.1;
+      break;
+    case 62:
+      oGps.distCenter = processSlider(rest);
+      break;
+    case 63:
+      oGps.angleCenter = processSlider(rest);
+      break;
+    case 64:
+      optSquareSize = processSlider(rest);
+      break;
+    case 65:
+      optSquareOffset = processSlider(rest);
+      break;
+    case 66:
+      optSquareInc = processSlider(rest);
+      break;
+    case 67:
+      optSquareCycles = processSlider(rest);
       break;
     case 90:
       debugLevel = processSwitch(rest) ? L_NOTICE : L_WARNING;
@@ -402,6 +440,9 @@ void processCommand(uint16_t cmdNum, char *rest) {
       startCommand(CMD_FIND_PERIMETER);
       break;
     case 3:
+      currCmdAngle = INVALID_ANGLE;
+      currCmdLat = INVALID_COORD;
+      currCmdLon = INVALID_COORD;
       startCommand(CMD_ZIGZAG);
       break;
     case 4:
@@ -418,6 +459,17 @@ void processCommand(uint16_t cmdNum, char *rest) {
       break;
     case 8:
       startCommand(CMD_SPIRAL);
+      break;
+    case 21:
+      cmdTime = 180;
+      startCommand(CMD_MODE_POWERSAVE);
+      break;
+    case 22:
+      startCommand(CMD_MODE_NORMAL);
+      break;
+    case 23:
+      cmdTime = 0;
+      startCommand(CMD_SHUTDOWN);
       break;
     default:
       break;
@@ -541,13 +593,19 @@ void sendCurrentMenu(boolean update) {
       break;
     case 6:
       sendPointsMenu(update);
+      break;
+    case 7:
+      sendNavSettingsMenu(update);
+      break;
   }
 } // void sendCurrentMenu(boolean update)
 
+uint32_t lastRecv = 0;
+
 // Check console input
 void subCheckConsole() {
-  char c;
-  char *p, *next;
+  uint8_t c;
+  uint8_t *p, *next;
   boolean needUpdate = false;
 
   // Redisplay menu at every second
@@ -558,20 +616,52 @@ void subCheckConsole() {
 
   while (oSerial.available(PFODAPP_PORT)) {
     c = oSerial.read(PFODAPP_PORT);
+    // Check if we did receive our modbus ID, reset the buffer
     pfodRcvBuf[pfodLen] = c;
     pfodLen++;
-    if ((pfodLen == (sizeof(pfodRcvBuf) - 1)) || (c == '}')) {
-      pfodRcvBuf[pfodLen] = '\0';
-      next = pfodRcvBuf;
-      while (p = (char *) memchr((void *) next, '{', pfodLen + pfodRcvBuf - next)) {
-        if (processPfodCmd(p))
-          needUpdate = true;
-        next = p + 1;
+    // Check if we have modbus packet
+    if (pfodRcvBuf[0] == MODBUS_ID) {
+      // Check if we have full packet in the buffer
+      if (checkModbusPacket((uint8_t *) pfodRcvBuf, pfodLen)) {
+        // Ignore if we have something else in input buffer (stalled packets)
+        if (!oSerial.available(PFODAPP_PORT))
+          // Process packet, clear buffer and delay pfod menu update
+          parseModbus((uint8_t *) pfodRcvBuf, pfodLen);
+        pfodLen = 0;
+        lastPfodUpdate = millis();
+      } else {
+        // Check if we have stalled data in the buffer
+        if ((millis() - lastRecv) > 50) {
+          // Clear buffer and place new character at the start
+          pfodRcvBuf[0] = c;
+          pfodLen = 1;
+        }
       }
-      pfodLen = 0;
-      if (needUpdate)
-        lastPfodUpdate = millis() - 4000;
+      lastRecv = millis();
+    } else {
+      // Check if we have full pfod command
+      if ((pfodLen == (sizeof(pfodRcvBuf) - 1)) || (c == '}')) {
+        pfodRcvBuf[pfodLen] = '\0';
+        next = pfodRcvBuf;
+        while (p = (uint8_t *) memchr((void *) next, '{', pfodLen + pfodRcvBuf - next)) {
+          if (processPfodCmd((char *) p))
+            needUpdate = true;
+          next = p + 1;
+        }
+        pfodLen = 0;
+        if (needUpdate)
+          lastPfodUpdate = millis() - 4000;
+      } else {
+        // Check if we have received our modbus ID - discard, switch to modbus
+        if (c == MODBUS_ID) {
+          pfodRcvBuf[0] = c;
+          pfodLen = 1;
+        }
+      }
     }
+    // Strip leading \r or \n
+    if ((pfodLen == 1) && ((pfodRcvBuf[0] == '\r') || (pfodRcvBuf[0] == '\n')))
+      pfodLen = 0;
   }
 } // void subCheckConsole()
 

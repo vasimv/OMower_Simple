@@ -28,6 +28,10 @@ buttonsLeds oSwitches;
 motorMow oMow;
 pwmServo oPwm;
 sonars oSonars;
+rain oRain;
+drop oDrop;
+bumper oBumper;
+lawn oLawn;
 currentMow oCrrMow;
 currentPow oCrrPower;
 currentMotors oCrrMotors;
@@ -51,12 +55,9 @@ uint32_t cntPoll10 = 0;
 // Poll hook for 50Hz
 void poll50() {
   cntPoll50++;
+
   oImu.poll50();
   oPower.poll50();
-  
-  // Reset IMU if we've got an error
-  if (oImu.softError() == _hwstatus::ERROR)
-    oImu.init(&oSave);
 } // void poll50()
 
 // Poll hook for 20Hz
@@ -76,6 +77,7 @@ void poll10() {
   oMotors.poll10();
   oMow.poll10();
   oOdoMotors.poll10();
+  oBumper.poll10();
 
   // Blink led
   if (ledState) {
@@ -88,25 +90,27 @@ void poll10() {
 // Set default values for all object's configuration variables
 // OMower PCB v3,  4-cell LiFePo4 battery (14.8V max)
 void setDefaultVars() {
-  oMotors.accel = 64;
+  oMotors.accel = 128;
   oMotors.accelStop = 128; 
   oMotors.maxPWM = 255;
-  oMotors.minPWM = 64;
+  oMotors.minPWM = 128;
   oMotors.maxSpeed = 255;
   oMotors.pidRollP = 5.0;
   oMotors.pidRollI = 0.5;
   oMotors.pidRollD = 0.5;
-  oMotors.pidMoveP = 5.0;
-  oMotors.pidMoveI = 0.5;
-  oMotors.pidMoveD = 0.5;
+  oMotors.pidMoveP = 9.0;
+  oMotors.pidMoveI = 0.0;
+  oMotors.pidMoveD = 2.5;
   oCrrMotors.currentMax = 8.0;
-  oCrrMow.currentMax = 10.0;
+  oCrrMow.currentMax = 15.0;
+  oCrrPower.zeroOffset = 2059;
   oMow.accel = 32;
   oMow.accelStop = 64;
-  oMow.modulateSpeed = 255;
+  oMow.modulateSpeed = 0;
   oMow.modulatePeriod = 2000;
   oMow.heightMowMin = 55;
-  oMow.maxPWM = 128;
+  oMow.heightMow = 28;
+  oMow.maxPWM = 160;
   oImu.inclMag = -10.2;
   oPerim.minQuality = 1.1;
   oPerim.errorTimeout = 120;
@@ -118,18 +122,19 @@ void setDefaultVars() {
   oGps.stopDistancePrecision = 0.2;
   oSonars.triggerDist = 20;
   oPower.maxBatteryVoltage = 14.6;
-  oPower.minBatteryVoltage = 10.2;
+  oPower.minBatteryVoltage = 11;
   oPower.maxBatteryChargeStart = 14.2;
-  oPower.maxChargeCurrent = 4.0;
+  oPower.maxChargeCurrent = 6.0;
+  oPower.minSolarVoltage = 15.0;
 
   optSlowRatio = 1.0;
   optBackwardTime = 1500;
-  optRollTimeMin = 3000;
-  optRollTimeMax = 6000;
+  optRollTimeMin = 1500;
+  optRollTimeMax = 4000;
   optMowHeight = 0;
-  optSquareSize = 600;
-  optSquareCycles = 16;
-  optSquareInc = 20;
+  optSquareSize = 1054;
+  optSquareCycles = 104;
+  optSquareInc = 15;
   optSquareOffset = 100;
 #ifdef USE_DW1000
   oTag.maxTimeout = 400;
@@ -140,10 +145,16 @@ void setDefaultVars() {
 template<typename T> void loadSave(T &data, boolean save);
 
 template<typename T> void loadSave(T &data, boolean save) {
+  T tmp;
+  
   if (save)
     oSave.writeMem(data);
-  else
-    oSave.readMem(data);
+  else {
+    if (oSave.haveValid)
+      oSave.readMem(data);
+    else
+      oSave.readMem(tmp);
+  }
 } // void loadSave(T data, boolean save)
 
 // Load or save settings from NVMEM
@@ -151,54 +162,53 @@ void loadSaveVars(boolean save) {
   // use stored address in NVMEM to load/save settings from
   oSave.curAddr = nvmemAddr;
   // Load stuff
-  if (save || oSave.haveValid) {
-    loadSave(oMotors.accel, save);
-    loadSave(oMotors.accelStop, save);
-    loadSave(oMotors.maxPWM, save);
-    loadSave(oMotors.minPWM, save);
-    loadSave(oMotors.maxSpeed, save);
-    loadSave(oMotors.pidRollP, save);
-    loadSave(oMotors.pidRollI, save);
-    loadSave(oMotors.pidRollD, save);
-    loadSave(oMotors.pidMoveP, save);
-    loadSave(oMotors.pidMoveI, save);
-    loadSave(oMotors.pidMoveD, save);
-    loadSave(oCrrMotors.currentMax, save);
-    loadSave(oCrrMow.currentMax, save);
-    loadSave(oMow.accel, save);
-    loadSave(oMow.accelStop, save);
-    loadSave(oMow.modulateSpeed, save);
-    loadSave(oMow.modulatePeriod, save);
-    loadSave(oMow.heightMowMin, save);
-    loadSave(oMow.maxPWM, save);
-    loadSave(oImu.inclMag, save);
-    loadSave(oPerim.minQuality, save);
-    loadSave(oPerim.errorTimeout, save);
-    loadSave(oPerim.invertMag, save);
-    loadSave(oGps.maxTimeout, save);
-    loadSave(oGps.angleCenter, save);
-    loadSave(oGps.distCenter, save);
-    loadSave(oGps.stopDistance, save);
-    loadSave(oGps.stopDistancePrecision, save);
-    loadSave(oSonars.triggerDist, save);
-    loadSave(oPower.maxBatteryVoltage, save);
-    loadSave(oPower.minBatteryVoltage, save);
-    loadSave(oPower.maxBatteryChargeStart, save);
-    loadSave(oPower.maxChargeCurrent, save);
-  
-    loadSave(optSlowRatio, save);
-    loadSave(optBackwardTime, save);
-    loadSave(optRollTimeMin, save);
-    loadSave(optRollTimeMax, save);
-    loadSave(optMowHeight, save);
-    loadSave(optSquareSize, save);
-    loadSave(optSquareCycles, save);
-    loadSave(optSquareInc, save);
-    loadSave(optSquareOffset, save);
+  debug(L_NOTICE, (char *) F("load/save to address %08x %d %d\n"), oSave.curAddr, save, (save || oSave.haveValid));
+  loadSave(oMotors.accel, save);
+  loadSave(oMotors.accelStop, save);
+  loadSave(oMotors.maxPWM, save);
+  loadSave(oMotors.minPWM, save);
+  loadSave(oMotors.maxSpeed, save);
+  loadSave(oMotors.pidRollP, save);
+  loadSave(oMotors.pidRollI, save);
+  loadSave(oMotors.pidRollD, save);
+  loadSave(oMotors.pidMoveP, save);
+  loadSave(oMotors.pidMoveI, save);
+  loadSave(oMotors.pidMoveD, save);
+  loadSave(oCrrMotors.currentMax, save);
+  loadSave(oCrrMow.currentMax, save);
+  loadSave(oMow.accel, save);
+  loadSave(oMow.accelStop, save);
+  loadSave(oMow.modulateSpeed, save);
+  loadSave(oMow.modulatePeriod, save);
+  loadSave(oMow.heightMowMin, save);
+  loadSave(oMow.maxPWM, save);
+  loadSave(oImu.inclMag, save);
+  loadSave(oPerim.minQuality, save);
+  loadSave(oPerim.errorTimeout, save);
+  loadSave(oPerim.invertMag, save);
+  loadSave(oGps.maxTimeout, save);
+  loadSave(oGps.angleCenter, save);
+  loadSave(oGps.distCenter, save);
+  loadSave(oGps.stopDistance, save);
+  loadSave(oGps.stopDistancePrecision, save);
+  loadSave(oSonars.triggerDist, save);
+  loadSave(oPower.maxBatteryVoltage, save);
+  loadSave(oPower.minBatteryVoltage, save);
+  loadSave(oPower.maxBatteryChargeStart, save);
+  loadSave(oPower.maxChargeCurrent, save);
+  loadSave(oPower.minSolarVoltage, save);  
+  loadSave(optSlowRatio, save);
+  loadSave(optBackwardTime, save);
+  loadSave(optRollTimeMin, save);
+  loadSave(optRollTimeMax, save);
+  loadSave(optMowHeight, save);
+  loadSave(optSquareSize, save);
+  loadSave(optSquareCycles, save);
+  loadSave(optSquareInc, save);
+  loadSave(optSquareOffset, save);
 #ifdef USE_DW1000                                                                                             
     loadSave(oTag.maxTimeout, save);
 #endif
-  }
   if (save) {
     oImu.saveCalib();
     oSave.commit();
@@ -208,7 +218,7 @@ void loadSaveVars(boolean save) {
 
 void setup() {
   // Set speed for console UART
-  Serial.begin(115200);
+  consInit(460800);
 
   // Link sensor objects
   oMotors.currentSens = &oCrrMotors;
@@ -244,6 +254,10 @@ void setup() {
   oSwitches.begin();
   oMow.begin();
   oOdoMotors.begin();
+  oTag.begin();
+
+  // Remember nvmem current address to load/save values
+  nvmemAddr = oSave.curAddr;
 
   // Load variables from NVMEM
   loadSaveVars(false);
@@ -257,15 +271,16 @@ void setup() {
   oMow.init();
   oSonars.init();
   oOdoMotors.init();
-
-  // Remember nvmem current address to load/save values
-  nvmemAddr = oSave.curAddr;
+  oBumper.init();
 
 #ifdef USE_DW1000
-  oTag.init();
   oTag.imuSens = &oImu;
   oTag.serialPorts = &oSerial;
   oTag.tagPort = SERIAL3_PORT;
+  // Pass-through mode (coordinates from radiotag module will be feed to the GPS module)
+  oTag.passGps = &oGps;
+
+  oTag.init();
 #endif
   debug(L_WARNING, (char *) F("Hardware init complete\n"));
 
@@ -304,7 +319,7 @@ void displayStuff() {
   char tmpS[32];
   
   // Display info (since it takes long time - only when CMD_STOP
-  if ((cmdRun == CMD_STOP) && ((millis() - cmdStartTime) > 5000)) {
+  if (((cmdRun == CMD_STOP) || (cmdRun == CMD_MODE_POWERSAVE)) && ((millis() - cmdStartTime) > 5000)) {
     u8g2.clearBuffer();
     u8g2.setFont(u8g2_font_profont22_mr);
     rpl_snprintf(tmpS, sizeof(tmpS), "%.2f %.1f", oPower.readSensor(P_BATTERY), oCrrPower.readCurrent(P_BATTERY));
@@ -315,6 +330,7 @@ void displayStuff() {
     u8g2.drawStr(0,57, tmpS);
     u8g2.sendBuffer();
   }
+
   debug(L_NOTICE, (char *) F("int %lu %lu %lu %lu, p50/20/10 %lu %lu %lu\n"),
         millis(), micros(), adcCounter, cyclesPollNum, cntPoll50, cntPoll20, cntPoll10);
   debug(L_DEBUG, (char *) F("adc scan: "));

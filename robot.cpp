@@ -6,13 +6,35 @@
 #include "pfod.h"
 
 // Commands labels
-const char *cmdLabels[] = { "STOP", "MOVE", "FIND_PERIMETER", "ZIGZAG", "NORTH", "SOUTH", "EAST", "WEST", "SPIRAL", "ERROR" };
+const char *cmdLabels[] = { "STOP", "MOVE", "FIND_PERIMETER", "ZIGZAG", "NORTH", "SOUTH", "EAST", "WEST", "SPIRAL",
+                            "POINT", "ERROR", "EXT_MOVE_ANGLE", "EXT_MOVE_GPS", "EXT_MOVE_TAGS", "EXT_ROLL_ANGLE",
+                            "EXT_REVERSE", "EXT_ROLL_PERIMETER", "EXT_MOVE_PERIMETER", "EXT_CALIB_START",
+                            "EXT_CALIB_FINISH", "EXT_SAVE_NVMEM", "PSAVE", "NORMAL", "SHUTDOWN" };
 
 // Current command running
 uint16_t cmdRun = CMD_STOP;
 
 // Current command's flags
 uint16_t cmdFlags = 0;
+
+// For modbus interface commands
+// Time of execution (in milliseconds)
+uint32_t cmdTime;
+
+// Angle for movement
+int16_t currCmdAngle;
+
+// Coordinates for GPS/RTK GPS movement
+int32_t currCmdLat;
+int32_t currCmdLon;
+
+// Coordinates for radiotag movement
+int32_t currCmdX;
+int32_t currCmdY;
+uint16_t currCmdRoom;
+
+// Last command stop reason
+uint16_t cmdStopReason;
 
 // Finish sub-command (new command received or serious hardware error)
 boolean finishSub = false;
@@ -74,8 +96,28 @@ uint32_t lastLoop = 0;
 
 // Check important stuff (battery, commands received, GPS serial port), reset IMU if needed
 void subMustCheck() {
+  uint8_t nChecks = 0;
+
   lastLoop = millis();
   subCheckConsole();
+
+  // Reset IMU if we've got an error
+  if (oImu.softError() == _hwstatus::ERROR)
+    oImu.init(&oSave);
+
+  // Check for battery voltage for emergency shutdown
+  while (oPower.readSensor(P_BATTERY) < oPower.minBatteryVoltage) {
+    // Don't turn off robot for first 5 minutes or if charging is in progress
+    if ((millis() < 300000) || (oCrrPower.readCurrent(P_BATTERY) < -0.2))
+      break;
+    delay(100);
+    nChecks++;
+    if (nChecks > 10) {
+      debug(L_WARNING, (char *) F("Battery voltage is discharged completely, shutting down!\n"));
+      delay(50);
+      oPower.emergShutdown();
+    }
+  }
 } // void subMustCheck()
 
 // Set speeds of wheel and mowing motors
@@ -106,6 +148,8 @@ boolean subCheckMow() {
 // Reset mowing motor driver
 void subResetMow() {
   debug(L_NOTICE, (char *) F("subResetMow: resetting mowing motor driver\n"));
+  // Stop moving around while resetting mowing motors driver
+  oMotors.emergStop();
   oMow.init();
 } // Reset mowing motor driver
 
@@ -129,6 +173,7 @@ uint32_t subStop() {
   uint32_t stopTime = millis();
   
   oMotors.emergStop();
+  oMow.maxSpeed = 0;
   subWaitMotorsStop();
   return millis() - stopTime;
 } // uint32_t subStop(uint16_t flags)
@@ -137,6 +182,7 @@ uint32_t subStop() {
 void subResetMotors() {
   debug(L_NOTICE, (char *) F("subResetMotors: resetting motor drivers\n"));
   oMotors.emergStop();
+  oMow.maxSpeed = 0;
   subWaitMotorsStop();
   oMotors.init();
   delay(100);  
@@ -178,6 +224,16 @@ _dir subCheckSonar() {
 
 // Check bumpers and return direction of which bumper hit
 _dir subCheckBumper() {
+  boolean left, right;
+
+  left = oBumper.readSensor(0);
+  right = oBumper.readSensor(1);
+  if (left && right)
+    return _dir::FORWARD;
+  if (left)
+    return _dir::LEFT;
+  if (right)
+    return _dir::RIGHT;
   return _dir::STOP;
 } // _dir subCheckBumper()
 
@@ -207,8 +263,10 @@ uint32_t subRoll(uint16_t flags, uint32_t timeout, _dir dirMove, int16_t angle) 
         // Initialize rolling by an angle
         oImu.setCourse(angle);
         oMotors.rollCourse((navThing *) &oImu, leftTime);
-      } else
+      } else {
+        cmdStopReason = FIN_TIME;
         return leftTime;
+      }
     }
 
     // Internal loop
@@ -223,8 +281,13 @@ uint32_t subRoll(uint16_t flags, uint32_t timeout, _dir dirMove, int16_t angle) 
       // Check and reset motor drivers if needed
       if (subCheckMotors()) {
         subResetMotors();
+        if (flags & FL_SIMPLE_MOVE) {
+          cmdStopReason = FIN_MOTORS;
+          return leftTime;
+        }
         // Move a bit backward in case if this is caused by an obstacle
-        subMove(flags | FL_IGNORE_SONAR | FL_IGNORE_BUMPER, optBackwardTime, _dir::BACKWARD, INVALID_ANGLE, INVALID_COORD, INVALID_COORD);
+        subMove(flags | FL_IGNORE_SONAR | FL_IGNORE_BUMPER, optBackwardTime, _dir::BACKWARD,
+                INVALID_ANGLE, INVALID_COORD, INVALID_COORD);
         break;
       }
       if (!(flags & FL_IGNORE_WIRE)) {
@@ -232,12 +295,14 @@ uint32_t subRoll(uint16_t flags, uint32_t timeout, _dir dirMove, int16_t angle) 
           // Check special stop condition
           if (flags & FL_STOP_INSIDE) {
             subStop();
+            cmdStopReason = FIN_PERIMETER;
             return leftTime;
           }
         } else {
           // Check special stop condition
           if (flags & FL_STOP_OUTSIDE) {
             subStop();
+            cmdStopReason = FIN_PERIMETER;
             return leftTime;
           }
         }
@@ -247,6 +312,7 @@ uint32_t subRoll(uint16_t flags, uint32_t timeout, _dir dirMove, int16_t angle) 
     leftTime = (int32_t) subEnd - (int32_t) millis();
   }
 
+  cmdStopReason = FIN_TIME;
   if (leftTime >= 0)
     return leftTime;
   else
@@ -283,6 +349,10 @@ uint32_t subPerimSearch(uint16_t flags, uint32_t timeout) {
       // Check and reset motor drivers if needed
       if (subCheckMotors()) {
         subResetMotors();
+        if (flags & FL_SIMPLE_MOVE) {
+          cmdStopReason = FIN_MOTORS;
+          return leftTime;
+        }
         // Move a bit backward in case if this is caused by an obstacle
         subMove(flags | FL_IGNORE_SONAR | FL_IGNORE_BUMPER, optBackwardTime, _dir::BACKWARD, INVALID_ANGLE, INVALID_COORD, INVALID_COORD);
         break;
@@ -292,20 +362,24 @@ uint32_t subPerimSearch(uint16_t flags, uint32_t timeout) {
           // Check special stop condition
           if (flags & FL_STOP_INSIDE) {
             subStop();
+            cmdStopReason = FIN_PERIMETER;
             return leftTime;
           }
         } else {
           // Check special stop condition
           if (flags & FL_STOP_OUTSIDE) {
             subStop();
+            cmdStopReason = FIN_PERIMETER;
             return leftTime;
           }
         }
       }
       // Check if we weren't move for 2 seconds
       if ((oMotors.curPWM(0) == 0) && (oMotors.curPWM(1) == 0)) {
-        if ((millis() - lastMove) > 2000)
+        if ((millis() - lastMove) > 2000) {
+          cmdStopReason = FIN_DESTINATION;
           return leftTime;
+        }
       } else
         lastMove = millis();
     }
@@ -313,6 +387,7 @@ uint32_t subPerimSearch(uint16_t flags, uint32_t timeout) {
     leftTime = (int32_t) subEnd - (int32_t) millis();
   }
 
+  cmdStopReason = FIN_TIME;
   if (leftTime >= 0)
     return leftTime;
   else
@@ -332,8 +407,9 @@ uint32_t subMove(uint16_t flags, uint32_t timeout, _dir dirMove, int16_t angle, 
   boolean perimTrack = false;
   int32_t latNext, lonNext;
 
-  debug(L_INFO, (char *) F("subMove: flags %hx, timeout %lu, dirMove %hd, angle %hd, latitude %ld, longitude %ld\n"),
+  debug(L_INFO, (char *) F("subMove: flags %02hX, timeout %lu, dirMove %hd, angle %hd, latitude %ld, longitude %ld\n"),
         flags, timeout, dirMove, angle, latitude, longitude);
+
   while (!finishSub && (millis() < subEnd)) {
     // Set speed of wheel and mowing motors
     subSpeedSetup(flags);
@@ -344,10 +420,11 @@ uint32_t subMove(uint16_t flags, uint32_t timeout, _dir dirMove, int16_t angle, 
     } else {
       if (angle != INVALID_ANGLE) {
         // Move by an angle (IMU)
-        if ((flags & FL_IGNORE_IMU) || (oImu.softError() != _hwstatus::ONLINE))
+        if ((flags & FL_IGNORE_IMU) || (oImu.softError() != _hwstatus::ONLINE)) {
           // Well, we have to ignore IMU or it is not available, let's just stop
+          debug(L_NOTICE, (char *) F("subMove: IMU error %hd\n"), oImu.softError());
           return leftTime;
-        // Initialize movement by an angle
+        }
         oImu.setCourse(angle);
         oMotors.moveCourse((navThing *) &oImu, leftTime);
       } else
@@ -374,7 +451,6 @@ uint32_t subMove(uint16_t flags, uint32_t timeout, _dir dirMove, int16_t angle, 
     // Internal loop
     while (!finishSub && (millis() < subEnd)) {
       leftTime = (int32_t) subEnd - (int32_t) millis();
-      
       // Check stuff like battery, commands, GPS serial port and reset IMU when needed
       subMustCheck();
       // Check rain sensor
@@ -385,26 +461,47 @@ uint32_t subMove(uint16_t flags, uint32_t timeout, _dir dirMove, int16_t angle, 
       // Check and reset motor drivers if needed
       if (subCheckMotors()) {
         subResetMotors();
+        // Simply stop if we have simple move flag
+        if (flags & FL_SIMPLE_MOVE) {
+          cmdStopReason = FIN_MOTORS;
+          return leftTime;
+        }
         // Move a bit backward in case if this is caused by an obstacle
-        subMove(flags | FL_IGNORE_SONAR | FL_IGNORE_BUMPER, optBackwardTime, _dir::BACKWARD, INVALID_ANGLE, INVALID_COORD, INVALID_COORD);
+        subMove(flags | FL_IGNORE_SONAR | FL_IGNORE_BUMPER, optBackwardTime, _dir::BACKWARD,
+                INVALID_ANGLE, INVALID_COORD, INVALID_COORD);
         break;
       }
 
       // Check and reset mowing motor if needed
       if (subCheckMow()) {
+        // Simply stop if we have simple move flag
+        if (flags & FL_SIMPLE_MOVE) {
+          cmdStopReason = FIN_MOWER;
+          return leftTime;
+        }
         subResetMow();
       }
 
       // Check sonar and bumper sensors
-      if ((!(flags & FL_IGNORE_SONAR) && ((resSonar = subCheckSonar()) != _dir::STOP)) || (!(flags & FL_IGNORE_BUMPER) && ((resBumper = subCheckBumper()) != _dir::STOP))) {
+      if ((!(flags & FL_IGNORE_SONAR) && ((resSonar = subCheckSonar()) != _dir::STOP))
+          || (!(flags & FL_IGNORE_BUMPER) && ((resBumper = subCheckBumper()) != _dir::STOP))) {
         _dir dirRoll;
 
-        debug(L_NOTICE, (char *) F("Found obstacle, moving around\n"));
+        debug(L_NOTICE, (char *) F("Found obstacle\n"));
         subStop();
+        // Check if we should try to move around or just stop
+        if (flags & FL_SIMPLE_MOVE) {
+          if (resSonar != _dir::STOP)
+            cmdStopReason = FIN_SONAR;
+          else
+            cmdStopReason = FIN_BUMPER;
+          return leftTime;
+        }
         // Calculate coordinates of the next point after moving around the obstacle (2 meters away)
         if (latitude != INVALID_COORD)
           oGps.calcPoint(2.0, latNext, lonNext, latitude, longitude);
-        subMove(flags | FL_STOP_OUTSIDE | FL_IGNORE_SONAR | FL_IGNORE_BUMPER, optBackwardTime, _dir::BACKWARD, INVALID_ANGLE, INVALID_COORD, INVALID_COORD);
+        subMove(flags | FL_STOP_OUTSIDE | FL_IGNORE_SONAR | FL_IGNORE_BUMPER, optBackwardTime,
+                _dir::BACKWARD, INVALID_ANGLE, INVALID_COORD, INVALID_COORD);
         subStop();
         // Try to roll in other direction than an obstacle
         if ((resSonar == _dir::LEFT) || (resBumper == _dir::LEFT))
@@ -412,8 +509,10 @@ uint32_t subMove(uint16_t flags, uint32_t timeout, _dir dirMove, int16_t angle, 
         else {
           dirRoll = _dir::LEFT;
         }
-        subRoll(flags | FL_STOP_OUTSIDE | FL_IGNORE_SONAR, getRandomRange(optRollTimeMin, optRollTimeMax), dirRoll, INVALID_ANGLE);
-        subMove(flags | FL_STOP_OUTSIDE | FL_IGNORE_SONAR, getRandomRange(optRollTimeMin, optRollTimeMax), _dir::FORWARD, INVALID_ANGLE, INVALID_COORD, INVALID_COORD);
+        subRoll(flags | FL_STOP_OUTSIDE | FL_IGNORE_SONAR, getRandomRange(optRollTimeMin, optRollTimeMax),
+                dirRoll, INVALID_ANGLE);
+        subMove(flags | FL_STOP_OUTSIDE | FL_IGNORE_SONAR, getRandomRange(optRollTimeMin, optRollTimeMax),
+                _dir::FORWARD, INVALID_ANGLE, INVALID_COORD, INVALID_COORD);
         subStop();
         // Return to way point
         if (latitude != INVALID_COORD) {
@@ -431,6 +530,7 @@ uint32_t subMove(uint16_t flags, uint32_t timeout, _dir dirMove, int16_t angle, 
           if (flags & FL_STOP_INSIDE) {
             debug(L_NOTICE, (char *) F("subMove: Inside perimeter, stop\n"));
             subStop();
+            cmdStopReason = FIN_PERIMETER;
             return leftTime;
           }
         } else {
@@ -438,11 +538,14 @@ uint32_t subMove(uint16_t flags, uint32_t timeout, _dir dirMove, int16_t angle, 
           if ((flags & FL_STOP_INSIDE) || perimTrack)
             continue;
           // Perform stop when reached out of perimeter
-          debug(L_NOTICE, (char *) F("subMove: Out of perimeter %hd (%f) %hd (%f), stop\n"), oPerim.magnitude(0), oPerim.quality(0), oPerim.magnitude(1), oPerim.quality(1));
+          debug(L_NOTICE, (char *) F("subMove: Out of perimeter %hd (%f) %hd (%f), stop\n"),
+                oPerim.magnitude(0), oPerim.quality(0), oPerim.magnitude(1), oPerim.quality(1));
           subStop();
           // Check special stop condition
-          if (flags & FL_STOP_OUTSIDE)
+          if ((flags & FL_STOP_OUTSIDE) || (flags & FL_SIMPLE_MOVE)) {
+            cmdStopReason = FIN_PERIMETER;
             return leftTime;
+          }
             
           // Well, we've got out of perimeter, let's move inside
           // Save time and count for crude detection "end of field" without mapping
@@ -496,6 +599,7 @@ uint32_t subMove(uint16_t flags, uint32_t timeout, _dir dirMove, int16_t angle, 
         float maxDist = 3;
         // Check if we're close enough
         if (oGps.reachedDest()) {
+          cmdStopReason = FIN_DESTINATION;
           finishSub = true;
           subStop();
           break;
@@ -504,6 +608,7 @@ uint32_t subMove(uint16_t flags, uint32_t timeout, _dir dirMove, int16_t angle, 
     }
   }
 
+  cmdStopReason = FIN_TIME;
   if (leftTime >= 0)
     return leftTime;
   else
@@ -518,14 +623,32 @@ void startCommand(uint16_t cmd) {
     cmdRun = cmd;
     finishSub = true;
     cmdStartTime = millis();
+    cmdStopReason = FIN_NONE;
+    // Disable perimeters calculations if needed
+    if (cmdFlags & FL_DISABLE_WIRE)
+      oPerim.disableThings();
+    else
+      oPerim.enableThings();
   }
 } // void startCommand(uint16_t cmd)
+
+// Modbus interface start new command (data has command code)
+void startExtCommand(void *addr, uint32_t data, uint8_t size) {
+  startCommand((uint16_t) data);
+  // cmdFlags |= FL_SIMPLE_MOVE;
+} // void startExtCommand(void *addr, uint32_t data, uint8_t size)
+
+// Yield function with WFI to save power at delays
+void yield() {
+  asm("wfi");
+} // void yield()
 
 // Main loop
 void loop() {
   int32_t sLat, sLon;
   int32_t newStartLat, newStartLon;
   int32_t tmpSize;
+  int8_t signOffset;
   
   if ((millis() - lastDisplay) > 5000) {
     lastDisplay = millis();
@@ -545,15 +668,118 @@ void loop() {
       // Check if mowing height was changed by pfod and set it
       if (((millis() / 1000) % 10 == 0) && (optMowHeight != oMow.heightMow))
           oMow.setHeight(optMowHeight);
+      cmdStopReason = FIN_TIME;
       break;
+
     case CMD_MOVE:
       if (cmdFlags & FL_IGNORE_IMU)
         subMove(cmdFlags, 180000, _dir::FORWARD, INVALID_ANGLE, INVALID_COORD, INVALID_COORD);
-      else
-        subMove(cmdFlags, 180000, _dir::STOP, oImu.readCurDegree(0), INVALID_COORD, INVALID_COORD);
+      else {
+        if (currCmdLat == INVALID_COORD)
+          subMove(cmdFlags, 180000, _dir::STOP, oImu.readCurDegree(0), INVALID_COORD, INVALID_COORD);
+        else
+          subMove(cmdFlags, 180000, _dir::STOP, INVALID_ANGLE, currCmdLat, currCmdLon);
+      }
       subStop();
       cmdRun = CMD_STOP;
+      cmdStopReason = FIN_TIME;
       break;
+
+    case CMD_EXT_MOVE_ANGLE:
+      if (currCmdAngle == INVALID_ANGLE) {
+        debug(L_INFO, (char *) F("Moving forward for %lu ms\n"), cmdTime);
+        subMove(cmdFlags, cmdTime, _dir::FORWARD, INVALID_ANGLE, INVALID_COORD, INVALID_COORD);
+      } else {
+        debug(L_INFO, (char *) F("Moving to angle %hd for %lu ms\n"), currCmdAngle, cmdTime);
+        subMove(cmdFlags, cmdTime, _dir::STOP, currCmdAngle, INVALID_COORD, INVALID_COORD);
+      }
+      subStop();
+      cmdRun = CMD_STOP;
+      if (cmdStopReason != FIN_NONE)
+        cmdStopReason = FIN_TIME;
+      break;
+
+    case CMD_EXT_MOVE_GPS:
+      finishSub = false;
+      if (cmdFlags & FL_HIGH_PRECISION) {
+        // Delay until we get precision coordinates
+        debug(L_INFO, (char *) F("Waiting for high precision coordinates\n"));
+        if ((oGps.numSats < 128) && !finishSub) {
+          subMustCheck();
+          delay(10);
+          return;
+        }
+      }
+      if (!finishSub) {
+        debug(L_INFO, (char *) F("Moving to point %ld %ld (from %ld %ld) for %lu ms\n"),
+              currCmdLat, currCmdLon, oGps.latitude, oGps.longitude, cmdTime);
+        subMove(cmdFlags, cmdTime, _dir::STOP, INVALID_ANGLE, currCmdLat, currCmdLon);
+      }
+      subStop();
+      cmdRun = CMD_STOP;
+      if (cmdStopReason != FIN_NONE)
+        cmdStopReason = FIN_TIME;
+      break;
+
+    // Not implemented yet
+    case CMD_EXT_MOVE_TAGS:
+      cmdRun = CMD_STOP;
+      cmdStopReason = FIN_HARDWARE;
+      break;
+
+    case CMD_EXT_ROLL_ANGLE:
+      debug(L_INFO, (char *) F("Rolling to angle %hd for %lu ms\n"), currCmdAngle, cmdTime);
+      subRoll(cmdFlags, cmdTime, _dir::STOP, currCmdAngle);
+      subStop();
+      cmdRun = CMD_STOP;
+      if (cmdStopReason != FIN_NONE)
+        cmdStopReason = FIN_TIME;
+      break;
+
+    case CMD_EXT_REVERSE:
+      debug(L_INFO, (char *) F("Moving to backward for %lu ms\n"), cmdTime);
+      subMove(cmdFlags, cmdTime, _dir::BACKWARD, INVALID_ANGLE, INVALID_COORD, INVALID_COORD);
+      subStop();
+      cmdRun = CMD_STOP;
+      if (cmdStopReason != FIN_NONE)
+        cmdStopReason = FIN_TIME;
+      break;
+
+    case CMD_EXT_ROLL_PERIMETER:
+      debug(L_INFO, (char *) F("Rolling around to find perimeter for %lu ms\n"), cmdTime);
+      subPerimSearch(cmdFlags, cmdTime);
+      subStop();
+      cmdRun = CMD_STOP;
+      if (cmdStopReason != FIN_NONE)
+        cmdStopReason = FIN_TIME;
+      break;
+
+    // Not implemented yet
+    case CMD_EXT_MOVE_PERIMETER:
+      subStop();
+      cmdRun = CMD_STOP;
+      if (cmdStopReason != FIN_NONE)
+        cmdStopReason = FIN_TIME;
+      break;
+
+    case CMD_EXT_CALIB_START:
+      resetCompassCalib();
+      cmdRun = CMD_STOP;
+      cmdStopReason = FIN_TIME;
+      break;
+
+    case CMD_EXT_CALIB_FINISH:
+      stopCompassCalib();
+      cmdRun = CMD_STOP;
+      cmdStopReason = FIN_TIME;
+      break;
+
+    case CMD_EXT_SAVE_NVMEM:
+      loadSaveVars(true);
+      cmdRun = CMD_STOP;
+      cmdStopReason = FIN_TIME;
+      break;
+
     case CMD_NORTH:
     case CMD_SOUTH:
     case CMD_EAST:
@@ -577,6 +803,7 @@ void loop() {
       subMove(cmdFlags, 180000, _dir::STOP, angle, INVALID_COORD, INVALID_COORD);
       subStop();
       cmdRun = CMD_STOP;
+      cmdStopReason = FIN_TIME;
       break;
     case CMD_FIND_PERIMETER:
       // Find perimeter
@@ -601,6 +828,7 @@ void loop() {
       subMove(cmdFlags | FL_IGNORE_WIRE, 100000, _dir::STOP, INVALID_ANGLE, pointLat, pointLon);
       subStop();
       cmdRun = CMD_STOP;
+      cmdStopReason = FIN_TIME;
       break;
     case CMD_ZIGZAG:
       // process square in zigzag pattern
@@ -613,8 +841,21 @@ void loop() {
         return;
       }
       ledState = 1;
-      sLat = oGps.latitude;
-      sLon = oGps.longitude;
+      // If we have set coordinates, move to start point first. Otherwise - use current coordinates as start point
+      if (currCmdLat != INVALID_COORD) {
+        sLat = currCmdLat;
+        sLon = currCmdLon;
+        subMove(cmdFlags | FL_IGNORE_WIRE | FL_HIGH_PRECISION, 180000, _dir::STOP, INVALID_ANGLE, sLat, sLon);
+      } else {
+        sLat = oGps.latitude;
+        sLon = oGps.longitude;
+      }
+
+      // Choose direction
+      if (currCmdAngle == 0)
+        signOffset = 1;
+      else
+        signOffset = -1;
 
       debug(L_INFO, (char *) F("Square start, initial position %ld %ld\n"), sLat, sLon);
       for (uint16_t i = 1; i <= optSquareCycles; i++) {
@@ -622,9 +863,9 @@ void loop() {
           break;
         finishSub = false;
         if ((i % 2) == 1)
-          subMove(cmdFlags | FL_IGNORE_WIRE | FL_HIGH_PRECISION, 100000, _dir::STOP, INVALID_ANGLE, sLat + i * optSquareInc + optSquareOffset, sLon + optSquareSize);
+          subMove(cmdFlags | FL_IGNORE_WIRE | FL_HIGH_PRECISION, 100000, _dir::STOP, INVALID_ANGLE, sLat + signOffset * i * optSquareInc + optSquareOffset, sLon + optSquareSize);
         else
-          subMove(cmdFlags | FL_IGNORE_WIRE | FL_HIGH_PRECISION, 100000, _dir::STOP, INVALID_ANGLE, sLat + i * optSquareInc, sLon);
+          subMove(cmdFlags | FL_IGNORE_WIRE | FL_HIGH_PRECISION, 100000, _dir::STOP, INVALID_ANGLE, sLat + signOffset * i * optSquareInc, sLon);
       }
       finishSub = false;
       if (cmdRun == CMD_ZIGZAG) {
@@ -677,9 +918,52 @@ void loop() {
         debug(L_INFO, (char *) F("Spiral done, returning to starting position %ld %ld\n"), sLat, sLon);
         subMove(cmdFlags | FL_IGNORE_WIRE | FL_HIGH_PRECISION | FL_SAVE_POWER, 100000, _dir::STOP, INVALID_ANGLE, sLat, sLon);
       }
+      cmdStopReason = FIN_TIME;
+      break;
+    case CMD_MODE_POWERSAVE:
+      if (!oSwitches.readSensor(T_EXTLED1)) {
+        debug(L_INFO, (char *) F("Entering power save mode\n"));
+        oMotors.disableThings();
+        oSonars.disableThings();
+        oPerim.disableThings();
+        oPower.disableThings();
+        oMow.disableThings();
+        oSwitches.setLED(T_EXTLED1, true);
+      }
+      // Stop power save mode when time come
+      if ((cmdStartTime + cmdTime) < millis()) {
+        cmdRun = CMD_MODE_NORMAL;
+        cmdStopReason = FIN_TIME;
+      } else
+        delay(5);
+      break;
+    case CMD_MODE_NORMAL:
+      debug(L_INFO, (char *) F("Exiting power save mode\n"));
+      oMotors.enableThings();
+      oSonars.enableThings();
+      oPerim.enableThings();
+      oPower.enableThings();
+      oMow.enableThings();
+      oSwitches.setLED(T_EXTLED1, false);
+      delay(50);
+      cmdRun = CMD_STOP;
+      cmdStopReason = FIN_TIME;
+      break;
+    case CMD_SHUTDOWN:
+      // Check if time to shutdown came
+      if ((cmdStartTime + cmdTime) < millis()) {
+        // Sometimes relay do stuck, we have to pulse it few times
+        for (uint8_t i = 0; i < 32; i++) {
+          oPower.emergShutdown();
+          delay(2000);
+        }
+        cmdRun = CMD_STOP;
+      }
+      delay(5);
       break;
     case CMD_ERROR:
       delay(100);
+      cmdStopReason = FIN_TIME;
       break;
   }
 

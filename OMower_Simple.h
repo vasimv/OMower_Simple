@@ -6,7 +6,7 @@
 #define _OMOWER_SIMPLE_H
 
 // Use DW1000 radio tags for navigation
-//#define USE_DW1000
+#define USE_DW1000
 
 // OMower SDK includes
 #include <omower-root.h>
@@ -23,6 +23,10 @@
 #include <omower-mow.h>
 #include <omower-pwmservo.h>
 #include <omower-sonars.h>
+#include <omower-lawn.h>
+#include <omower-rain.h>
+#include <omower-drop.h>
+#include <omower-bumper.h>
 #include <omower-power.h>
 #include <omower-nvmem.h>
 #include <omower-serial.h>
@@ -34,7 +38,7 @@
 #include <xsystem.h>
 
 // Software revision number (used for NVMEM check, must be changed if different numbers of variables saved)
-#define REVISION 0x00000001
+#define REVISION 0x00000002
 
 // OMower SDK objects
 extern chassis oChassis;
@@ -49,9 +53,14 @@ extern buttonsLeds oSwitches;
 extern motorMow oMow;
 extern pwmServo oPwm;
 extern sonars oSonars;
+extern bumper oBumper;
+extern drop oDrop;
+extern rain oRain;
+extern lawn oLawn;
 extern currentMow oCrrMow;
 extern currentPow oCrrPower;
 extern currentMotors oCrrMotors;
+extern odometryMotors oOdoMotors;
 extern power oPower;
 extern rtc oRtc;
 extern serial oSerial;
