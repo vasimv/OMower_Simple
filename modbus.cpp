@@ -183,6 +183,12 @@ modbusMap_t modbusMap[] = {
 {(void *) &optSquareOffset, 2, &readVal, &writeVal}, // I:SOPT_SQUAREOFFSET
 };
 
+#ifdef USE_ROS
+#define MODBUS_WRITE(msg,len) oROS.publishCmd(msg, len)
+#else
+#define MODBUS_WRITE(msg,len) oSerial.write(MODBUS_PORT, msg, len)
+#endif
+
 // Output modbus packet buffer
 uint8_t bufModbusOut[256];
 
@@ -312,7 +318,7 @@ void parseModbus(uint8_t *packet, uint8_t length) {
     bufModbusOut[2] = 0x01;
     crc = modbusCrc(bufModbusOut, 3);
     putModbus16(bufModbusOut + 3, crc);
-    oSerial.write(MODBUS_PORT, bufModbusOut, 5);
+    MODBUS_WRITE(bufModbusOut, 5);
     return;
   }
   debug(L_INFO, (char *) F("Modbus packet, function code %hd, length %hd\n"), packet[1], length);
@@ -322,7 +328,7 @@ void parseModbus(uint8_t *packet, uint8_t length) {
       regStart = packet[3] | (packet[2] << 8);
       regNum = packet[5] | (packet[4] << 8);
       lengthOut = createModbusOut(MODBUS_ID, packet[1], regStart, regNum);
-      oSerial.write(MODBUS_PORT, bufModbusOut, lengthOut);
+      MODBUS_WRITE(bufModbusOut, lengthOut);
       return;
     // Write holding registers
     case 0x10:
@@ -337,7 +343,7 @@ void parseModbus(uint8_t *packet, uint8_t length) {
       bufModbusOut[5] = regNum * 2;
       crc = modbusCrc(bufModbusOut, 6);
       putModbus16(bufModbusOut + 6, crc);
-      oSerial.write(MODBUS_PORT, bufModbusOut, 8);
+      MODBUS_WRITE(bufModbusOut, 8);
       return;
     default:
       break;
@@ -347,7 +353,7 @@ void parseModbus(uint8_t *packet, uint8_t length) {
   bufModbusOut[1] = 0x80 | packet[1];
   crc = modbusCrc(bufModbusOut, 2);
   putModbus16(bufModbusOut + 2, crc);
-  oSerial.write(MODBUS_PORT, bufModbusOut, 4);
+  MODBUS_WRITE(bufModbusOut, 4);
 } // void parseModbus(uint8_t *packet, uint8_t length)
 
 // Read size'th bytes from param address

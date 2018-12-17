@@ -8,9 +8,13 @@
 // Use DW1000 radio tags for navigation
 #define USE_DW1000
 
+// Use I2C OLED display connected to pins 74/75
+#define USE_OLED_DISPLAY
+
 // OMower SDK includes
 #include <omower-root.h>
 #include <omower-defs.h>
+#include <omower-ros.h>
 #include <omower-motors.h>
 #include <omower-odometry.h>
 #include <omower-imu.h>
@@ -33,12 +37,14 @@
 #ifdef USE_DW1000
 #include <omower-radiotag.h>
 #endif
+#include <omower-seeker.h>
+#include <omower-virtperim.h>
 
 // For rpl_vsnprintf and rpl_snprintf with float support
 #include <xsystem.h>
 
 // Software revision number (used for NVMEM check, must be changed if different numbers of variables saved)
-#define REVISION 0x00000002
+#define REVISION 0x00000003
 
 // OMower SDK objects
 extern chassis oChassis;
@@ -49,6 +55,8 @@ extern gps oGps;
 #ifdef USE_DW1000
 extern radiotag oTag;
 #endif
+extern seeker oSeeker;
+extern virtPerim oVPerim;
 extern buttonsLeds oSwitches;
 extern motorMow oMow;
 extern pwmServo oPwm;
@@ -74,6 +82,9 @@ extern volatile uint8_t ledState;
 
 // Load/save settings variables through NVMEM object
 void loadSaveVars(boolean save);
+
+// Delay with ROS's spinOnce
+void delayWithROS(int pause);
 
 void displayStuff();
 #endif

@@ -33,6 +33,7 @@
 #define CMD_SPIRAL 8
 #define CMD_POINT 9
 #define CMD_ERROR 10
+#define CMD_MOVE_SEEKER 24
 // Modbus interface commands (also CMD_STOP)
 #define CMD_EXT_MOVE_ANGLE 11
 #define CMD_EXT_MOVE_GPS 12
@@ -48,6 +49,10 @@
 #define CMD_MODE_POWERSAVE 21
 #define CMD_MODE_NORMAL 22
 #define CMD_SHUTDOWN 23
+// Return to home station by gps+seeker
+#define CMD_HOME 25
+// Mowed the lawn by virtual perimeter
+#define CMD_VIRT_LAWN 26
 
 // Stop reasons
 // Command is executing
@@ -142,6 +147,16 @@ extern int16_t optSquareOffset;
 // target coordinates (form CMD_POINT)
 extern int32_t pointLat, pointLon;
 
+// Coordinates for CMD_HOME command
+// Start point for CMD_HOME (inside of mowing area)
+extern int32_t homeFLat, homeFLon;
+// Point near of the base to switch to seeker
+extern int32_t homeLLat, homeLLon;
+// Direction to the base from homeLLat,homeLLon point
+extern int16_t homeDir;
+
+// Coordinates of emergency return point inside virtual perimeter
+extern int32_t virtRLat, virtRLon;
 
 // Change current command
 void startCommand(uint16_t cmd);
@@ -154,6 +169,9 @@ void resetCompassCalib();
 
 // Stop compass calibration
 void stopCompassCalib();
+
+// Perform accelerometer calibration (robot must stay on flat leveled surface!)
+void accelCalib();
 
 // Subcommand to move, returns execution time in milliseconds
 // dirMove == _dir::STOP - use angle or coordinates

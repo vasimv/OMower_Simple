@@ -9,7 +9,7 @@
 const char *cmdLabels[] = { "STOP", "MOVE", "FIND_PERIMETER", "ZIGZAG", "NORTH", "SOUTH", "EAST", "WEST", "SPIRAL",
                             "POINT", "ERROR", "EXT_MOVE_ANGLE", "EXT_MOVE_GPS", "EXT_MOVE_TAGS", "EXT_ROLL_ANGLE",
                             "EXT_REVERSE", "EXT_ROLL_PERIMETER", "EXT_MOVE_PERIMETER", "EXT_CALIB_START",
-                            "EXT_CALIB_FINISH", "EXT_SAVE_NVMEM", "PSAVE", "NORMAL", "SHUTDOWN" };
+                            "EXT_CALIB_FINISH", "EXT_SAVE_NVMEM", "PSAVE", "NORMAL", "SHUTDOWN", "MOVE_SEEKER", "HOME", "VIRT_LAWN" };
 
 // Current command running
 uint16_t cmdRun = CMD_STOP;
@@ -41,6 +41,7 @@ boolean finishSub = false;
 
 // Last turn direction at perimeter
 _dir lastPerimTurn = _dir::LEFT;
+uint16_t lastPerimTurnCount = 0;
 
 // Last perimeter out time and counter increasing if the turn was in less than 20 seconds
 uint32_t lastPerimOut = 0;
@@ -74,6 +75,17 @@ int16_t optSquareOffset;
 // target coordinates (for CMD_POINT)
 int32_t pointLat, pointLon;
 
+// Coordinates for CMD_HOME command
+// Start point for CMD_HOME (inside of mowing area)
+int32_t homeFLat, homeFLon;
+// Point near of the base to switch to seeker
+int32_t homeLLat, homeLLon;
+// Direction to the base from homeLLat,homeLLon point
+int16_t homeDir;
+
+// Coordinates for emergency return point inside virtual perimeter
+int32_t virtRLat, virtRLon;
+
 // Returns random number in range
 uint32_t getRandomRange(uint32_t minNum, uint32_t maxNum) {
   return random(minNum, maxNum);
@@ -91,6 +103,11 @@ void stopCompassCalib() {
   ledState = 1;
 } // void stopCompassCalib()
 
+// Perform accelerometer calibration (robot must stay on flat leveled surface!)
+void accelCalib() {
+  oImu.calibAccel();
+} // void accelCalib()
+
 uint32_t lastDisplay = 0;
 uint32_t lastLoop = 0;
 
@@ -100,6 +117,7 @@ void subMustCheck() {
 
   lastLoop = millis();
   subCheckConsole();
+  oROS.spinOnce();
 
   // Reset IMU if we've got an error
   if (oImu.softError() == _hwstatus::ERROR)
@@ -107,14 +125,15 @@ void subMustCheck() {
 
   // Check for battery voltage for emergency shutdown
   while (oPower.readSensor(P_BATTERY) < oPower.minBatteryVoltage) {
+    oPower.reportToROS();
     // Don't turn off robot for first 5 minutes or if charging is in progress
     if ((millis() < 300000) || (oCrrPower.readCurrent(P_BATTERY) < -0.2))
       break;
-    delay(100);
+    delayWithROS(100);
     nChecks++;
     if (nChecks > 10) {
       debug(L_WARNING, (char *) F("Battery voltage is discharged completely, shutting down!\n"));
-      delay(50);
+      delayWithROS(50);
       oPower.emergShutdown();
     }
   }
@@ -137,12 +156,22 @@ void subSpeedSetup(uint16_t flags) {
 
 // Check overload/fails on motors
 boolean subCheckMotors() {
-  return (oMotors.softError() == _hwstatus::ERROR);
+  if (oMotors.softError() == _hwstatus::ERROR) {
+    oMotors.reportToROS();
+    oCrrMotors.reportToROS();
+    return true;
+  }
+  return false;
 } // boolean subCheckMotors()
 
 // Check overload/fails on mowing motor
 boolean subCheckMow() {
-  return (oMow.softError() == _hwstatus::ERROR);
+  if (oMow.softError() == _hwstatus::ERROR) {
+    oMow.reportToROS();
+    oCrrMow.reportToROS();
+    return true;
+  }
+  return false;
 } // boolean subCheckMow()
 
 // Reset mowing motor driver
@@ -185,9 +214,8 @@ void subResetMotors() {
   oMow.maxSpeed = 0;
   subWaitMotorsStop();
   oMotors.init();
-  delay(100);  
+  delayWithROS(100);  
 } // void subResetMotors()
-
 
 
 // Check rain sensor, switch to station return if detected
@@ -202,21 +230,29 @@ void subCheckDrop() {
 
 // Check sonars and return direction of which sonar hit
 _dir subCheckSonar() {
+  int left, right, forward;
+
+  left = oSonars.readSonar(0);
+  forward = oSonars.readSonar(1);
+  right = oSonars.readSonar(2);
   // Check center sonar if we do have it
   if (((oSonars.locThings() == _locationThings::JUSTONE)
        || (oSonars.locThings() == _locationThings::LEFT_CENTER_RIGHT))
-      && ((oSonars.readSonar(1) > 0) && (oSonars.readSonar(1) < oSonars.triggerDist))) {
-    debug(L_INFO, (char *) F("subCheckSonar: center %hu\n"), oSonars.readSonar(1));
+      && ((forward > 0) && (forward < oSonars.triggerDist))) {
+    debug(L_INFO, (char *) F("subCheckSonar: center %d\n"), forward);
+    oSonars.reportToROS();
     return _dir::FORWARD;
   }
   // Check left forward sonar
-  if ((oSonars.readSonar(0) > 0) && (oSonars.readSonar(0) < oSonars.triggerDist)) {
-    debug(L_INFO, (char *) F("subCheckSonar: left %hu\n"), oSonars.readSonar(0));
+  if ((left > 0) && (left < oSonars.triggerDist)) {
+    debug(L_INFO, (char *) F("subCheckSonar: left %d\n"), left);
+    oSonars.reportToROS();
     return _dir::LEFT;
   }
   // Check right forward sonar
-  if ((oSonars.readSonar(2) > 0) && (oSonars.readSonar(2) < oSonars.triggerDist)) {
-    debug(L_INFO, (char *) F("subCheckSonar: right %hu\n"), oSonars.readSonar(2));
+  if ((right > 0) && (right < oSonars.triggerDist)) {
+    debug(L_INFO, (char *) F("subCheckSonar: right %d\n"), right);
+    oSonars.reportToROS();
     return _dir::RIGHT;
   }
   return _dir::STOP;
@@ -228,14 +264,45 @@ _dir subCheckBumper() {
 
   left = oBumper.readSensor(0);
   right = oBumper.readSensor(1);
-  if (left && right)
+  if (left && right) {
+    oBumper.reportToROS();
     return _dir::FORWARD;
-  if (left)
+  }
+  if (left) {
+    oBumper.reportToROS();
     return _dir::LEFT;
-  if (right)
+  }
+  if (right) {
+    oBumper.reportToROS();
     return _dir::RIGHT;
+  }
   return _dir::STOP;
 } // _dir subCheckBumper()
+
+// Check perimeter (wire and virtual). Note, it returns "true" when both perimeters are disabled!
+boolean subCheckPerimeter(uint16_t flags) {
+  // Both perimeters are disabled by flags, so we return "inside" status
+  if ((flags & FL_IGNORE_WIRE) && (flags & FL_IGNORE_VIRTUAL))
+    return true;
+  // Check perimeter
+  if ((!(flags & FL_IGNORE_WIRE) && oPerim.inside(-1))
+      || (!(flags & FL_IGNORE_VIRTUAL) && oVPerim.inside()))
+    return true;
+
+  // Check if we're out of perimeter too long
+  if ((!(flags & FL_IGNORE_WIRE) && (oPerim.softError() != _hwstatus::ONLINE))
+      || (!(flags & FL_IGNORE_VIRTUAL) && (oVPerim.softError() != _hwstatus::ONLINE))) {
+    if (flags & FL_IGNORE_WIRE)
+      oVPerim.reportToROS();
+    else
+      oPerim.reportToROS();
+    debug(L_INFO, (char *) F("subCheckPerimeter: breaking execution because softError [wire: %d, virtual: %d]\n"),
+          (int) oPerim.softError(), (int) oVPerim.softError());
+    finishSub = true;
+    cmdStopReason = FIN_PERIMETER;
+  }
+  return false;
+} // boolean subCheckPerimeter(uint16_t flags)
 
 // Subcommand to roll, returns execution time in milliseconds
 // dirMove == _dir::STOP - use angle
@@ -244,7 +311,9 @@ uint32_t subRoll(uint16_t flags, uint32_t timeout, _dir dirMove, int16_t angle) 
   uint32_t subStart = millis();
   uint32_t subEnd = millis() + timeout;
   int32_t leftTime = timeout;
+  boolean checkImu = false;
 
+  cmdStopReason = FIN_NONE;
   debug(L_INFO, (char *) F("subRoll: flags %hx, timeout %lu, dirMove %hd, angle %hd\n"),
         flags, timeout, dirMove, angle);
   while (!finishSub && (millis() < subEnd)) {
@@ -261,8 +330,9 @@ uint32_t subRoll(uint16_t flags, uint32_t timeout, _dir dirMove, int16_t angle) 
           // Well, we have to ignore IMU or it is not available, let's just stop
           return leftTime;
         // Initialize rolling by an angle
-        oImu.setCourse(angle);
+        oImu.setCourse(angle, true);
         oMotors.rollCourse((navThing *) &oImu, leftTime);
+        checkImu = true;
       } else {
         cmdStopReason = FIN_TIME;
         return leftTime;
@@ -290,10 +360,20 @@ uint32_t subRoll(uint16_t flags, uint32_t timeout, _dir dirMove, int16_t angle) 
                 INVALID_ANGLE, INVALID_COORD, INVALID_COORD);
         break;
       }
+
+      // Check if we've reached needed angle
+      if (checkImu && oImu.reachedDest()) {
+        subStop();
+        cmdStopReason = FIN_DESTINATION;
+        return leftTime;
+      }
+        
+      // Roll until we get in or out of the wire perimeter
       if (!(flags & FL_IGNORE_WIRE)) {
         if (oPerim.inside(-1)) {
           // Check special stop condition
           if (flags & FL_STOP_INSIDE) {
+            oPerim.reportToROS();
             subStop();
             cmdStopReason = FIN_PERIMETER;
             return leftTime;
@@ -301,6 +381,28 @@ uint32_t subRoll(uint16_t flags, uint32_t timeout, _dir dirMove, int16_t angle) 
         } else {
           // Check special stop condition
           if (flags & FL_STOP_OUTSIDE) {
+            oPerim.reportToROS();
+            subStop();
+            cmdStopReason = FIN_PERIMETER;
+            return leftTime;
+          }
+        }
+      }
+
+      // Roll until we get in or out of the virtual perimeter
+      if (!(flags & FL_IGNORE_VIRTUAL)) {
+        if (oVPerim.inside()) {
+          // Check special stop condition
+          if (flags & FL_STOP_INSIDE) {
+            oVPerim.reportToROS();
+            subStop();
+            cmdStopReason = FIN_PERIMETER;
+            return leftTime;
+          }
+        } else {
+          // Check special stop condition
+          if (flags & FL_STOP_OUTSIDE) {
+            oVPerim.reportToROS();
             subStop();
             cmdStopReason = FIN_PERIMETER;
             return leftTime;
@@ -312,20 +414,24 @@ uint32_t subRoll(uint16_t flags, uint32_t timeout, _dir dirMove, int16_t angle) 
     leftTime = (int32_t) subEnd - (int32_t) millis();
   }
 
-  cmdStopReason = FIN_TIME;
+  if (cmdStopReason == FIN_NONE)
+    cmdStopReason = FIN_TIME;
   if (leftTime >= 0)
     return leftTime;
   else
     return 0;
 } // uint32_t subRoll(uint16_t flags, uint32_t timeout, _dir dirMove, int16_t angle)
 
-// Roll to perimeter's maximum signal strength (first roll around, then roll to maximum of this)
+// Roll to perimeter's maximum signal strength
+// For wire perimeter - first roll around, then roll to maximum of this
+// For virtual perimeter - just roll to direction of closest point
 uint32_t subPerimSearch(uint16_t flags, uint32_t timeout) {
   uint32_t subStart = millis();
   uint32_t subEnd = millis() + timeout;
   int32_t leftTime = timeout;
   uint32_t lastMove;
 
+  cmdStopReason = FIN_NONE;
   debug(L_INFO, (char *) F("subPerimSearch: flags %hx, timeout %lu\n"),
         flags, timeout);
   while (!finishSub && (millis() < subEnd)) {
@@ -333,8 +439,14 @@ uint32_t subPerimSearch(uint16_t flags, uint32_t timeout) {
     subSpeedSetup(flags);
 
     // Start rolling
-    oPerim.setTracking(false);
-    oMotors.rollCourse((navThing *) &oPerim, leftTime);
+    if (!(flags & FL_IGNORE_WIRE)) {
+      oPerim.setTracking(false);
+      oMotors.rollCourse((navThing *) &oPerim, leftTime);
+    }
+    if (!(flags & FL_IGNORE_VIRTUAL)) {
+      oVPerim.setTracking(false);
+      oMotors.rollCourse((navThing *) &oVPerim, leftTime);
+    }
     lastMove = millis();
     
     // Internal loop
@@ -354,13 +466,16 @@ uint32_t subPerimSearch(uint16_t flags, uint32_t timeout) {
           return leftTime;
         }
         // Move a bit backward in case if this is caused by an obstacle
-        subMove(flags | FL_IGNORE_SONAR | FL_IGNORE_BUMPER, optBackwardTime, _dir::BACKWARD, INVALID_ANGLE, INVALID_COORD, INVALID_COORD);
+        subMove(flags | FL_IGNORE_SONAR | FL_IGNORE_BUMPER | FL_SAVE_POWER, optBackwardTime, _dir::BACKWARD, INVALID_ANGLE, INVALID_COORD, INVALID_COORD);
         break;
       }
-      if (!(flags & FL_IGNORE_WIRE)) {
-        if (oPerim.inside(-1)) {
+      if (!(flags & FL_IGNORE_WIRE) || !(flags & FL_IGNORE_VIRTUAL)) {
+        if (subCheckPerimeter(flags)) {
           // Check special stop condition
           if (flags & FL_STOP_INSIDE) {
+            debug(L_INFO, (char *) F("subPerimSearch: inside perimeter, stopping\n"));
+            // Move a bit longer to be sure we'll get into perimeter
+            subMove(flags | FL_IGNORE_SONAR | FL_IGNORE_BUMPER | FL_SAVE_POWER, optBackwardTime / 2, _dir::BACKWARD, INVALID_ANGLE, INVALID_COORD, INVALID_COORD);
             subStop();
             cmdStopReason = FIN_PERIMETER;
             return leftTime;
@@ -368,14 +483,23 @@ uint32_t subPerimSearch(uint16_t flags, uint32_t timeout) {
         } else {
           // Check special stop condition
           if (flags & FL_STOP_OUTSIDE) {
+            debug(L_INFO, (char *) F("subPerimSearch: outside of perimeter, stopping\n"));
             subStop();
             cmdStopReason = FIN_PERIMETER;
             return leftTime;
           }
         }
       }
-      // Check if we weren't move for 2 seconds
-      if ((oMotors.curPWM(0) == 0) && (oMotors.curPWM(1) == 0)) {
+      // Check if we've parked in the station
+      if (oPower.readSensor(P_BATTERY) < oPower.readSensor(P_CHARGE)) {
+        oPower.reportToROS();
+        subStop();
+        cmdStopReason = FIN_CHARGE;
+        return leftTime;
+      }
+      // Check if we weren't move for 2 seconds or reached perimeter's direction
+      if (((oMotors.curPWM(0) == 0) && (oMotors.curPWM(1) == 0)) 
+          || (!(flags & FL_IGNORE_VIRTUAL) && oVPerim.reachedDest())) {
         if ((millis() - lastMove) > 2000) {
           cmdStopReason = FIN_DESTINATION;
           return leftTime;
@@ -405,8 +529,10 @@ uint32_t subMove(uint16_t flags, uint32_t timeout, _dir dirMove, int16_t angle, 
   int32_t leftTime = timeout;
   _dir resSonar, resBumper;
   boolean perimTrack = false;
+  boolean seekerCheck = false;
   int32_t latNext, lonNext;
 
+  cmdStopReason = FIN_NONE;
   debug(L_INFO, (char *) F("subMove: flags %02hX, timeout %lu, dirMove %hd, angle %hd, latitude %ld, longitude %ld\n"),
         flags, timeout, dirMove, angle, latitude, longitude);
 
@@ -416,36 +542,54 @@ uint32_t subMove(uint16_t flags, uint32_t timeout, _dir dirMove, int16_t angle, 
      
     // Start moving
     if (dirMove != _dir::STOP) {
+      debug(L_INFO, (char *) F("subMove: direction movement\n"));
       oMotors.move(dirMove, leftTime);
     } else {
-      if (angle != INVALID_ANGLE) {
+      if ((angle != INVALID_ANGLE) && (angle != -INVALID_ANGLE)) {
         // Move by an angle (IMU)
         if ((flags & FL_IGNORE_IMU) || (oImu.softError() != _hwstatus::ONLINE)) {
           // Well, we have to ignore IMU or it is not available, let's just stop
           debug(L_NOTICE, (char *) F("subMove: IMU error %hd\n"), oImu.softError());
           return leftTime;
         }
+        debug(L_INFO, (char *) F("subMove: moving by compass\n"));
         oImu.setCourse(angle);
         oMotors.moveCourse((navThing *) &oImu, leftTime);
-      } else
-        if (latitude != INVALID_COORD) {
-          // Move to GPS/tags coordinates
-          // GPS is not functioning, just stop
-          if (oGps.softError() != _hwstatus::ONLINE)
-            return leftTime;
-          // Initialize movement by the GPS
-          oGps.setTarget(latitude, longitude, (flags & FL_HIGH_PRECISION) > 0, true);
-          oMotors.moveCourse((navThing *) &oGps, leftTime);
+      } else {
+        if (angle == -INVALID_ANGLE) {
+          debug(L_INFO, (char *) F("subMove: moving by seeker\n"));
+          seekerCheck = true;
+          oSeeker.startSeeker(true, 40);
+          oMotors.moveCourse(&oSeeker, leftTime);
         } else {
-          if ((flags & FL_IGNORE_WIRE) && (flags & FL_IGNORE_VIRTUAL))
-            oMotors.move(_dir::STOP, leftTime);
-          else {
-            // Initialize movement by perimeter
-            perimTrack = true;
-            oPerim.setTracking(true);
-            oMotors.moveCourse((navThing *) &oPerim, leftTime);
+          if (latitude != INVALID_COORD) {
+            // Move to GPS/tags coordinates
+            // GPS is not functioning, just stop
+            if (oGps.softError() != _hwstatus::ONLINE)
+              return leftTime;
+            // Initialize movement by the GPS
+            debug(L_INFO, (char *) F("subMove: moving by GPS\n"));
+            oGps.setTarget(latitude, longitude, (flags & FL_HIGH_PRECISION) > 0, true);
+            oMotors.moveCourse(&oGps, leftTime);
+          } else {
+            if ((flags & FL_IGNORE_WIRE) && (flags & FL_IGNORE_VIRTUAL))
+              oMotors.move(_dir::STOP, leftTime);
+            else {
+              // Initialize movement by perimeter (wire or virtual)
+              perimTrack = true;
+              if (flags & FL_IGNORE_WIRE) {
+                debug(L_INFO, (char *) F("subMove: moving by virtual Perimeter\n"));
+                oVPerim.setTracking(true);
+                oMotors.moveCourse(&oVPerim, leftTime);
+              } else {
+                debug(L_INFO, (char *) F("subMove: moving by Perimeter\n"));
+                oPerim.setTracking(true);
+                oMotors.moveCourse(&oPerim, leftTime);
+              }
+            }
           }
         }
+      }
     }
 
     // Internal loop
@@ -467,7 +611,7 @@ uint32_t subMove(uint16_t flags, uint32_t timeout, _dir dirMove, int16_t angle, 
           return leftTime;
         }
         // Move a bit backward in case if this is caused by an obstacle
-        subMove(flags | FL_IGNORE_SONAR | FL_IGNORE_BUMPER, optBackwardTime, _dir::BACKWARD,
+        subMove(flags | FL_IGNORE_SONAR | FL_IGNORE_BUMPER | FL_SAVE_POWER, optBackwardTime, _dir::BACKWARD,
                 INVALID_ANGLE, INVALID_COORD, INVALID_COORD);
         break;
       }
@@ -523,9 +667,21 @@ uint32_t subMove(uint16_t flags, uint32_t timeout, _dir dirMove, int16_t angle, 
         break;
       }
 
-      // Check wire perimeter
-      if (!(flags & FL_IGNORE_WIRE)) {
-        if (oPerim.inside(-1)) {
+      // Check wire/virtual perimeter
+      if (!(flags & FL_IGNORE_WIRE) || !(flags & FL_IGNORE_VIRTUAL)) {
+        // Check if we don't know virtual perimeter status (no GPS info)
+        if (!(flags & FL_IGNORE_VIRTUAL) && oVPerim.unknown()) {
+          debug(L_INFO, (char *) F("Unknown virtual perimeter status, stopping\n"));
+          subStop();
+          while (!finishSub && oVPerim.unknown()) {
+            subMustCheck();
+            subCheckRain();
+            subCheckDrop();
+            delay(1);
+          }
+          break;
+        }
+        if (subCheckPerimeter(flags)) {
           // Check special stop condition
           if (flags & FL_STOP_INSIDE) {
             debug(L_NOTICE, (char *) F("subMove: Inside perimeter, stop\n"));
@@ -538,8 +694,8 @@ uint32_t subMove(uint16_t flags, uint32_t timeout, _dir dirMove, int16_t angle, 
           if ((flags & FL_STOP_INSIDE) || perimTrack)
             continue;
           // Perform stop when reached out of perimeter
-          debug(L_NOTICE, (char *) F("subMove: Out of perimeter %hd (%f) %hd (%f), stop\n"),
-                oPerim.magnitude(0), oPerim.quality(0), oPerim.magnitude(1), oPerim.quality(1));
+          debug(L_NOTICE, (char *) F("subMove: Out of perimeter, wire %hd (%f) %hd (%f), virtual %d, stop\n"),
+                oPerim.magnitude(0), oPerim.quality(0), oPerim.magnitude(1), oPerim.quality(1), (int) oVPerim.inside());
           subStop();
           // Check special stop condition
           if ((flags & FL_STOP_OUTSIDE) || (flags & FL_SIMPLE_MOVE)) {
@@ -556,26 +712,39 @@ uint32_t subMove(uint16_t flags, uint32_t timeout, _dir dirMove, int16_t angle, 
           lastPerimOut = millis();
 
           // Backward direction
-          subMove(FL_SAVE_POWER | FL_STOP_INSIDE | FL_IGNORE_SONAR, optBackwardTime, _dir::BACKWARD, INVALID_ANGLE, INVALID_COORD, INVALID_COORD);
+          subMove((flags & (FL_IGNORE_WIRE | FL_IGNORE_VIRTUAL)) | FL_SAVE_POWER | FL_STOP_INSIDE | FL_IGNORE_SONAR, optBackwardTime,
+                  _dir::BACKWARD, INVALID_ANGLE, INVALID_COORD, INVALID_COORD);
+          // If we've got inside - move backward a bit more
+          if (subCheckPerimeter(flags))
+            subMove(FL_SAVE_POWER | FL_IGNORE_WIRE | FL_IGNORE_VIRTUAL | FL_IGNORE_SONAR, optBackwardTime / 2,
+                    _dir::BACKWARD, INVALID_ANGLE, INVALID_COORD, INVALID_COORD);
           subStop();
             
-          if (oPerim.inside(-1)) {
+          if (subCheckPerimeter(flags)) {
             // Ok, we're inside after moving back, let's roll and continue
             // Switching turn direction
-            if (lastPerimTurn == _dir::LEFT)
-              lastPerimTurn = _dir::RIGHT;
-            else
-              lastPerimTurn = _dir::LEFT;
-            subRoll(FL_SAVE_POWER | FL_IGNORE_WIRE, getRandomRange(optRollTimeMin, optRollTimeMax), lastPerimTurn, INVALID_ANGLE);
+            if (lastPerimTurnCount > 3) {
+              lastPerimTurnCount = 0;
+              if (lastPerimTurn == _dir::LEFT)
+                lastPerimTurn = _dir::RIGHT;
+              else
+                lastPerimTurn = _dir::LEFT;
+            }
+            lastPerimTurnCount++;
+            subRoll(FL_SAVE_POWER | FL_IGNORE_WIRE | FL_IGNORE_VIRTUAL, getRandomRange(optRollTimeMin, optRollTimeMax), lastPerimTurn, INVALID_ANGLE);
             subStop();
           }
-          if (!oPerim.inside(-1)) {
+          // Perimeter check
+          if (!subCheckPerimeter(flags)) {
             lastOutCnt++;
             lastPerimOut = millis();
             
             // We are not inside. Looks like we have to roll around to find the perimeter and move a bit forward
-            subPerimSearch(FL_SAVE_POWER | FL_STOP_INSIDE, 40000);
-            subMove(FL_SAVE_POWER | FL_STOP_INSIDE, optBackwardTime * 3, _dir::FORWARD, INVALID_ANGLE, INVALID_COORD, INVALID_COORD);
+            subPerimSearch((flags & (FL_IGNORE_WIRE | FL_IGNORE_VIRTUAL)) | FL_SAVE_POWER | FL_STOP_INSIDE, 40000);
+            // If we haven't got inside the perimeter after rolling - move a bit forward
+            if (!subCheckPerimeter(flags))
+              subMove((flags & (FL_IGNORE_WIRE | FL_IGNORE_VIRTUAL)) | FL_SAVE_POWER | FL_STOP_INSIDE, optBackwardTime, _dir::FORWARD,
+                      INVALID_ANGLE, INVALID_COORD, INVALID_COORD);
             subStop();
           }
           if (angle != INVALID_ANGLE) {
@@ -602,13 +771,20 @@ uint32_t subMove(uint16_t flags, uint32_t timeout, _dir dirMove, int16_t angle, 
           cmdStopReason = FIN_DESTINATION;
           finishSub = true;
           subStop();
-          break;
+          return leftTime;
         }
+      }
+      if (seekerCheck && oSeeker.reachedDest()) {
+        cmdStopReason = FIN_DESTINATION;
+        finishSub = true;
+        subStop();
+        return leftTime;
       }
     }
   }
 
-  cmdStopReason = FIN_TIME;
+  if (cmdStopReason == FIN_NONE)
+    cmdStopReason = FIN_TIME;
   if (leftTime >= 0)
     return leftTime;
   else
@@ -649,6 +825,7 @@ void loop() {
   int32_t newStartLat, newStartLon;
   int32_t tmpSize;
   int8_t signOffset;
+  uint32_t endMowingTime;
   
   if ((millis() - lastDisplay) > 5000) {
     lastDisplay = millis();
@@ -672,14 +849,30 @@ void loop() {
       break;
 
     case CMD_MOVE:
-      if (cmdFlags & FL_IGNORE_IMU)
-        subMove(cmdFlags, 180000, _dir::FORWARD, INVALID_ANGLE, INVALID_COORD, INVALID_COORD);
-      else {
-        if (currCmdLat == INVALID_COORD)
-          subMove(cmdFlags, 180000, _dir::STOP, oImu.readCurDegree(0), INVALID_COORD, INVALID_COORD);
-        else
-          subMove(cmdFlags, 180000, _dir::STOP, INVALID_ANGLE, currCmdLat, currCmdLon);
+      subMove(cmdFlags, 180000, _dir::FORWARD, INVALID_ANGLE, INVALID_COORD, INVALID_COORD);
+      subStop();
+      cmdRun = CMD_STOP;
+      cmdStopReason = FIN_TIME;
+      break;
+
+    case CMD_VIRT_LAWN:
+      // Mowed the lawn by virtual perimeter (with emergency return when out of perimeter)
+      endMowingTime = millis() + cmdTime;
+
+      while ((cmdRun == CMD_VIRT_LAWN) && (millis() < endMowingTime)) {
+        cmdStopReason = FIN_NONE;
+        debug(L_INFO, (char *) F("Mowing by virtual perimeter (%d ms left)\n"), endMowingTime - millis());
+        finishSub = false;
+        subMove(cmdFlags, endMowingTime - millis(), _dir::FORWARD, INVALID_ANGLE, INVALID_COORD, INVALID_COORD);
+        // Check if we're out of perimeter - return to emergency point
+        if ((cmdStopReason == FIN_PERIMETER) || (cmdStopReason == FIN_TIME)) {
+          finishSub = false;
+          debug(L_INFO, (char *) F("Return to emergency point %ld, %ld\n"), virtRLat, virtRLon);
+          subMove(cmdFlags | FL_IGNORE_VIRTUAL | FL_IGNORE_WIRE | FL_SAVE_POWER, 360000, _dir::STOP,
+                  INVALID_ANGLE, virtRLat, virtRLon);
+        }
       }
+      debug(L_INFO, (char *) F("Finished mowing, stop reason %d\n"), cmdStopReason);
       subStop();
       cmdRun = CMD_STOP;
       cmdStopReason = FIN_TIME;
@@ -706,7 +899,7 @@ void loop() {
         debug(L_INFO, (char *) F("Waiting for high precision coordinates\n"));
         if ((oGps.numSats < 128) && !finishSub) {
           subMustCheck();
-          delay(10);
+          delayWithROS(10);
           return;
         }
       }
@@ -805,6 +998,15 @@ void loop() {
       cmdRun = CMD_STOP;
       cmdStopReason = FIN_TIME;
       break;
+
+    case CMD_MOVE_SEEKER:
+      debug(L_INFO, (char *) F("Moving to chessboard\n"));
+      subMove(cmdFlags, 360000, _dir::STOP, -INVALID_ANGLE, INVALID_COORD, INVALID_COORD);
+      subStop();
+      cmdRun = CMD_STOP;
+      cmdStopReason = FIN_TIME;
+      break;
+
     case CMD_FIND_PERIMETER:
       // Find perimeter
       subMove(cmdFlags | FL_STOP_OUTSIDE, 180000, _dir::FORWARD, INVALID_ANGLE, INVALID_COORD, INVALID_COORD);
@@ -812,13 +1014,14 @@ void loop() {
       if (cmdRun == CMD_FIND_PERIMETER)
         subMove(cmdFlags | FL_IGNORE_SONAR, 1800000, _dir::STOP, INVALID_ANGLE, INVALID_COORD, INVALID_COORD);
       break;
+
     case CMD_POINT:
       ledState = 2;
       if (cmdFlags & FL_HIGH_PRECISION) {
         // Delay until we get precision coordinates
         if (oGps.numSats < 128) {
           subMustCheck();
-          delay(10);
+          delayWithROS(10);
           return;
         }
       }
@@ -830,6 +1033,71 @@ void loop() {
       cmdRun = CMD_STOP;
       cmdStopReason = FIN_TIME;
       break;
+
+    case CMD_HOME:
+      ledState = 2;
+      if (cmdFlags & FL_HIGH_PRECISION) {
+        // Delay until we get precision coordinates
+        if (oGps.numSats < 128) {
+          subMustCheck();
+          delayWithROS(10);
+          return;
+        }
+      }
+      ledState = 1;
+      debug(L_INFO, (char *) F("Home - moving to first %d %d (from %d %d)\n"), homeFLat, homeFLon, oGps.latitude, oGps.longitude);
+      finishSub = false;
+      // Move to first point
+      subMove(cmdFlags | FL_IGNORE_WIRE | FL_SAVE_POWER, 4000000, _dir::STOP, INVALID_ANGLE, homeFLat, homeFLon);
+      debug(L_INFO, (char *) F("Home - stop reason %d\n"), cmdStopReason);
+      if (cmdStopReason != FIN_DESTINATION) {
+        cmdRun = CMD_STOP;
+        break;
+      }
+      debug(L_INFO, (char *) F("Home - moving to second %d %d (from %d %d)\n"), homeLLat, homeLLon, oGps.latitude, oGps.longitude);
+      finishSub = false;
+      // Move to second point (close to the base)
+      subMove(cmdFlags | FL_IGNORE_WIRE | FL_SAVE_POWER, 4000000, _dir::STOP, INVALID_ANGLE, homeLLat, homeLLon);
+      if (cmdStopReason != FIN_DESTINATION) {
+        cmdRun = CMD_STOP;
+        break;
+      }
+      debug(L_INFO, (char *) F("Home - turning to direction %d (from %d)\n"), (int) homeDir, (int) oImu.readCurDegree(-1));
+      finishSub = false;
+      subRoll(cmdFlags |FL_IGNORE_WIRE | FL_SAVE_POWER, 100000, _dir::STOP, homeDir);
+      if (cmdStopReason != FIN_DESTINATION) {
+        cmdRun = CMD_STOP;
+        break;
+      }
+      debug(L_INFO, (char *) F("Home - going with seeker\n"));
+      finishSub = false;
+      subMove(cmdFlags | FL_IGNORE_WIRE | FL_SAVE_POWER | FL_IGNORE_SONAR | FL_IGNORE_BUMPER, 50000, _dir::STOP, -INVALID_ANGLE, INVALID_COORD, INVALID_COORD);
+      finishSub = false;
+      // Check if we're at right angle for the station. If not, then go back
+      if ((cmdStopReason != FIN_DESTINATION) || (abs(oSeeker.offsetAngle) > 12)) {
+        debug(L_INFO, (char *) F("Home - wrong angle! Moving back."));
+        subMove(cmdFlags | FL_IGNORE_WIRE | FL_SAVE_POWER, 10000, _dir::BACKWARD, INVALID_ANGLE, INVALID_COORD, INVALID_COORD);
+        finishSub = false;
+        subMove(cmdFlags | FL_IGNORE_WIRE | FL_SAVE_POWER, 4000000, _dir::STOP, INVALID_ANGLE, homeLLat, homeLLon);
+        finishSub = false;
+        subMove(cmdFlags | FL_IGNORE_WIRE | FL_SAVE_POWER, 4000000, _dir::STOP, INVALID_ANGLE, homeFLat, homeFLon);
+        cmdRun = CMD_STOP;
+        break;
+      }
+      debug(L_INFO, (char *) F("Home - parking\n"));
+      subMove(cmdFlags | FL_IGNORE_WIRE | FL_SAVE_POWER | FL_IGNORE_SONAR | FL_IGNORE_BUMPER, 20000, _dir::FORWARD, INVALID_ANGLE, INVALID_COORD, INVALID_COORD);
+      finishSub = false;
+      if (cmdStopReason != FIN_CHARGE) {
+        debug(L_INFO, (char *) F("Home - no charge voltage! Moving back."));
+        subMove(cmdFlags | FL_IGNORE_WIRE | FL_SAVE_POWER, 10000, _dir::BACKWARD, INVALID_ANGLE, INVALID_COORD, INVALID_COORD);
+        finishSub = false;
+        subMove(cmdFlags | FL_IGNORE_WIRE | FL_SAVE_POWER, 4000000, _dir::STOP, INVALID_ANGLE, homeLLat, homeLLon);
+        finishSub = false;
+        subMove(cmdFlags | FL_IGNORE_WIRE | FL_SAVE_POWER, 4000000, _dir::STOP, INVALID_ANGLE, homeFLat, homeFLon);
+        cmdRun = CMD_STOP;
+      }
+      break;
+
     case CMD_ZIGZAG:
       // process square in zigzag pattern
       // Start coordinates.
@@ -837,7 +1105,7 @@ void loop() {
       // Delay until we get precision coordinates
       if (oGps.numSats < 128) {
         subMustCheck();
-        delay(10);
+        delayWithROS(10);
         return;
       }
       ledState = 1;
@@ -862,10 +1130,17 @@ void loop() {
         if (cmdRun != CMD_ZIGZAG)
           break;
         finishSub = false;
+#ifdef ZIGZAG_EASTWEST
         if ((i % 2) == 1)
           subMove(cmdFlags | FL_IGNORE_WIRE | FL_HIGH_PRECISION, 100000, _dir::STOP, INVALID_ANGLE, sLat + signOffset * i * optSquareInc + optSquareOffset, sLon + optSquareSize);
         else
           subMove(cmdFlags | FL_IGNORE_WIRE | FL_HIGH_PRECISION, 100000, _dir::STOP, INVALID_ANGLE, sLat + signOffset * i * optSquareInc, sLon);
+#else
+        if ((i % 2) == 1)
+          subMove(cmdFlags | FL_IGNORE_WIRE | FL_HIGH_PRECISION, 100000, _dir::STOP, INVALID_ANGLE, sLat + optSquareSize, sLon + signOffset * i * optSquareInc + optSquareOffset);
+        else
+          subMove(cmdFlags | FL_IGNORE_WIRE | FL_HIGH_PRECISION, 100000, _dir::STOP, INVALID_ANGLE, sLat, sLon + signOffset * i * optSquareInc);
+#endif
       }
       finishSub = false;
       if (cmdRun == CMD_ZIGZAG) {
@@ -873,12 +1148,13 @@ void loop() {
         subMove(cmdFlags | FL_IGNORE_WIRE | FL_HIGH_PRECISION | FL_SAVE_POWER, 100000, _dir::STOP, INVALID_ANGLE, sLat, sLon);
       }
       break;
+
     case CMD_SPIRAL:
       ledState = 2;
       // Delay until we get precision coordinates
       if (oGps.numSats < 128) {
         subMustCheck();
-        delay(10);
+        delayWithROS(10);
       }
       ledState = 1;
       sLat = oGps.latitude;
@@ -920,6 +1196,7 @@ void loop() {
       }
       cmdStopReason = FIN_TIME;
       break;
+
     case CMD_MODE_POWERSAVE:
       if (!oSwitches.readSensor(T_EXTLED1)) {
         debug(L_INFO, (char *) F("Entering power save mode\n"));
@@ -937,6 +1214,7 @@ void loop() {
       } else
         delay(5);
       break;
+
     case CMD_MODE_NORMAL:
       debug(L_INFO, (char *) F("Exiting power save mode\n"));
       oMotors.enableThings();
@@ -945,24 +1223,26 @@ void loop() {
       oPower.enableThings();
       oMow.enableThings();
       oSwitches.setLED(T_EXTLED1, false);
-      delay(50);
+      delayWithROS(50);
       cmdRun = CMD_STOP;
       cmdStopReason = FIN_TIME;
       break;
+
     case CMD_SHUTDOWN:
       // Check if time to shutdown came
       if ((cmdStartTime + cmdTime) < millis()) {
         // Sometimes relay do stuck, we have to pulse it few times
         for (uint8_t i = 0; i < 32; i++) {
           oPower.emergShutdown();
-          delay(2000);
+          delayWithROS(2000);
         }
         cmdRun = CMD_STOP;
       }
       delay(5);
       break;
+
     case CMD_ERROR:
-      delay(100);
+      delayWithROS(100);
       cmdStopReason = FIN_TIME;
       break;
   }
@@ -970,7 +1250,7 @@ void loop() {
   if (cmdRun != CMD_STOP) {
     oSwitches.setLED(T_BEEPER, true);
     oSwitches.setLED(T_EXTLED2, true);
-    delay(1000);
+    delayWithROS(1000);
     oSwitches.setLED(T_BEEPER, false);
     oSwitches.setLED(T_EXTLED2, false);
   }
