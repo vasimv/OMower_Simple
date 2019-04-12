@@ -8,6 +8,7 @@
 #include <max11617-adc-scan.h>
 #include "robot.h"
 #include "pfod.h"
+#include "rossupport.h"
 #include <DueTimer.h>
 
 #ifdef USE_OLED_DISPLAY
@@ -122,6 +123,7 @@ void setDefaultVars() {
   oPerim.errorTimeout = 120;
   oPerim.invertMag = true;
   oVPerim.errorTimeout = 30;
+  oGps.UTMmode = false;
   oGps.maxTimeout = 3000;
   oGps.angleCenter = -158;
   oGps.distCenter = 42;
@@ -139,8 +141,8 @@ void setDefaultVars() {
   optRollTimeMin = 2000;
   optRollTimeMax = 4000;
   optMowHeight = 0;
-  optSquareSize = 1054;
-  optSquareCycles = 104;
+  optSquareSize = 600;
+  optSquareCycles = 95;
   optSquareInc = 15;
   optSquareOffset = 100;
 #ifdef USE_DW1000
@@ -195,6 +197,7 @@ void loadSaveVars(boolean save) {
   loadSave(oPerim.errorTimeout, save);
   loadSave(oPerim.invertMag, save);
   loadSave(oVPerim.errorTimeout, save);
+  loadSave(oGps.UTMmode, save);
   loadSave(oGps.maxTimeout, save);
   loadSave(oGps.angleCenter, save);
   loadSave(oGps.distCenter, save);
@@ -335,6 +338,7 @@ void setup() {
   oChassis.setPollHooks(&poll50, &poll20, &poll10);
 
   #ifdef USE_ROS
+  rosSupportInit();
   debugLevel = L_NOTICE;
   #else
   debugLevel = L_WARNING;

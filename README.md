@@ -9,7 +9,7 @@ Move by GPS or RTK GPS (with RTK GPS you can use "zigzag" or "spiral" patterns)
 Move by compass
 
 
-The firmware is controlled by "pfodApp" program.
+The firmware is controlled by "pfodApp" program. It can be built with ROS support also (sensors data in internal format and /cmd_vel command supported).
 
 For OMower SDK running on OMower v3/v4 platform - you will need Orange PI Zero or wifi/bluetooth adapter.
 

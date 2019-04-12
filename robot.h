@@ -53,6 +53,10 @@
 #define CMD_HOME 25
 // Mowed the lawn by virtual perimeter
 #define CMD_VIRT_LAWN 26
+// ROS move_base_simple/goal command
+#define CMD_ROS_MOVE_GPS 27
+// ROS cmd_vel command
+#define CMD_ROS_CMDVEL 28
 
 // Stop reasons
 // Command is executing
@@ -83,6 +87,9 @@
 #define FIN_CHARGE 12
 // Destination reached
 #define FIN_DESTINATION 13
+
+// Maximum time of execution for /cmdvel
+#define ROS_CMDVEL_TIMEOUT 150
 
 // Labels for commands
 extern const char *cmdLabels[];
@@ -157,6 +164,9 @@ extern int16_t homeDir;
 
 // Coordinates of emergency return point inside virtual perimeter
 extern int32_t virtRLat, virtRLon;
+
+// Speeds for ROS_CMD_VEL
+extern float forwSpeed, yawSpeed;
 
 // Change current command
 void startCommand(uint16_t cmd);

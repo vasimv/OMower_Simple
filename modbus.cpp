@@ -421,7 +421,7 @@ void writeGpsLon(void *param, uint32_t data, uint8_t size) {
 void writeGpsSats(void *param, uint32_t data, uint8_t size) {
   tmpSats = data;
 
-  oGps.setCoords(tmpLat, tmpLon, tmpSats, 0, 0, 0, 0, 0, 0);
+  oGps.setCoords(tmpLat, tmpLon, tmpSats, 0, 0, 0, 0, 0, 0, 0, 0);
 } // void writeGpsSats(void *param, uint32_t data, uint8_t size)
 
 // Read IMU stuff
@@ -609,4 +609,3 @@ uint32_t readPWM(void *param, uint8_t size) {
   tmp = oMotors.curPWM((uint32_t) param);
    return *(uint32_t *) &tmp;
 } // uint32_t readPWM(void *param, uint8_t size)
-

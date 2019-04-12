@@ -331,7 +331,8 @@ void processGPSData(char *rest) {
   sscanf(rest+1, "%ld,%ld,%hu,%hu,%hu,%hu,%hu,%hu,%hu",
          &lat, &lon, &numSats, &year, &month, &day,
          &hour, &minute, &second);
-  oGps.setCoords(lat, lon, numSats, year, month, day, hour, minute, second);
+  oGps.UTMmode = false;
+  oGps.setCoords(lat, lon, 0, 0, numSats, year, month, day, hour, minute, second);
   debug(L_INFO, (char *) F("ext.GPS recv: %ld, %ld (%hu), %04hu-%02hu-%02hu %02hu:%02hu:%02hu\n"),
                  lat, lon, numSats, year, month, day, hour, minute, second);
 } // void processGPSData(char *rest)
